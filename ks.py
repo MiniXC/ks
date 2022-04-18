@@ -32,7 +32,7 @@ class Args:
     lm_url: str = 'www.openslr.org/resources/11'
     log_file: str = 'train.log'
     test_sets: str = 'dev_clean,test_clean,dev_other,test_other'
-    tts_test_path: str = '../Data/LibriTTS/dev-clean-aligned'
+    tts_test_path: str = '../alignments/test'
     local_data_path: str = 'data'
     local_exp_path: str = 'exp'
     mfcc_path: str = '{data}/mfcc'
@@ -49,7 +49,7 @@ class Args:
     tri2b_path: str = '{exp}/tri2b'
     tri3b_path: str = '{exp}/tri3b'
     score_sh_path: str = '../kaldi/egs/reverb/s5'
-    log_models: str = 'tri3b'
+    log_models: str = 'all'
 
 class Tasks():
     def __init__(self, logfile, kaldi_path):
@@ -91,7 +91,7 @@ class Tasks():
 run_name = generate_slug(2)
 
 def score_model(task, args, path, name, fmllr=False):
-    if name in args.log_models.split(','):
+    if args.log_models == 'all' or name in args.log_models.split(','):
         wandb.init(project="kaldi-synthesised-asr", reinit=True, name=f'{run_name}-{name}')
         wandb.config.update({'model': name})
 

@@ -40,4 +40,4 @@ def load_synth(src, dest):
     with open(Path(dest) / 'wav.scp', 'w') as wavscp:
         for utt in sorted(df['id'].unique()):
             wav = df[df['id']==utt]['wav'].values[0]
-            wavscp.write(f'{utt} sox {wav} -r 16000 -c 1 -b 16 -t wav - downsample |\n')
+            wavscp.write(f'{utt} sox {wav} -t wav -c 1 -b 16 -t wav - rate 16000 |\n')
