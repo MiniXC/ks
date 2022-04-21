@@ -520,8 +520,3 @@ def run(args):
 if __name__ == "__main__":
     (args,) = HfArgumentParser([Args]).parse_args_into_dataclasses()
     run(args)
-
-
-# single-speaker setup
-# resynthesis
-# only synthesising small subset
