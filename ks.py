@@ -1,12 +1,15 @@
 from pathlib import Path
 from dataclasses import dataclass, fields
 import subprocess
+import multiprocessing
 from typing import List
 import os
 from multiprocessing import cpu_count
 import re
 import shutil
+from time import sleep
 import sys
+from glob import glob
 
 from transformers import HfArgumentParser
 from rich import print as rprint
@@ -19,7 +22,7 @@ from prepare_synth import load_synth
 
 console = Console()
 cpus = cpu_count()
-
+#cpus = 20
 
 @dataclass
 class Args:
@@ -42,19 +45,18 @@ class Args:
     local_data_path: str = "data"
     local_exp_path: str = "exp"
     mfcc_path: str = "{data}/mfcc"
-    train_name: str = "Synthesised"
+    train_name: str = "synth"
     train_set: str = "n_topline"
-    synth_test_set: str = "dev_synth"
     train_cmd: str = "run.pl"
     lm_names: str = "tgsmall,tgmed"  # tglarge,fglarge
     mfcc_path: str = "{exp}/make_mfcc"
     mono_subset: int = 2000
     mono_path: str = "{exp}/mono"
-    tri1_subset: int = 5000
+    tri1_subset: int = 4000
     tri1_path: str = "{exp}/tri1"
     tri2b_path: str = "{exp}/tri2b"
     tri3b_path: str = "{exp}/tri3b"
-    log_models: str = "all"
+    log_stages: str = "all"
     nnet_path: str = "../kaldi/egs/librispeech/s5"
     nnet_script_path: str = (
         "../kaldi/egs/librispeech/s5/local/chain/tuning/run_tdnn_1d.sh"
@@ -63,6 +65,8 @@ class Args:
     verbose: bool = False
     run_name: str = None
     clean_stages: str = "none"
+    use_cmvn: bool = False
+    use_cnn: bool = False
 
 
 class Tasks:
@@ -143,17 +147,18 @@ run_name = generate_slug(2)
 def score_model(task, args, path, name, fmllr=False, lang_nosp=True, nnet=False):
     if args.run_name is not None:
         run_name = args.run_name
-    if args.log_models == "all" or name in args.log_models.split(","):
+    if args.log_stages == "all" or name in args.log_stages.split(","):
         wandb.init(
             project="kaldi-synthesised-asr",
             reinit=True,
-            name=f"{run_name}-{name}",
-            group=run_name,
+            job_type=f"evaluation",
+            group=f"{run_name}-{name}",
         )
         wandb.config.update(
             {
                 "model": name,
                 "group_name": run_name,
+                "train_set": args.train_set
             }
         )
         if nnet:
@@ -175,6 +180,7 @@ def score_model(task, args, path, name, fmllr=False, lang_nosp=True, nnet=False)
         for i, tst in enumerate(args.test_sets):
             graph_test_path = str(graph_path) + f"_{tst}"
             tst_path = args.local_data_path / (tst + "_small")
+            # tst_path = args.local_data_path / (tst + "_med")
             if fmllr:
                 p_decode = "_fmllr"
             else:
@@ -222,8 +228,37 @@ def score_model(task, args, path, name, fmllr=False, lang_nosp=True, nnet=False)
                 }
             )
 
+def monitor_nnet(args, name, nnet_path):
+    if args.run_name is not None:
+        run_name = args.run_name
+    wandb.init(
+        project="kaldi-synthesised-asr",
+        reinit=True,
+        job_type=f"training",
+        group=f"{run_name}-{name}",
+    )
+    last_iter = -1
+    while True:
+        logs = glob(nnet_path / 'log' / 'train*')
+        for log in logs:
+            iter = int(log.split('.')[-3])
+            if iter != last_iter:
+                log_text = open(log).read()
+                if 'Ended' in log_text:
+                    lfmmi, lfmmi_xent = re.findall('log-prob-per-frame=([^\s])', log_text)
+                lfmmi = float(lfmmi)
+                lfmmi_xent = float(lfmmi_xent)
+                wandb.log({
+                    'LF-MMI': lfmmi,
+                    'LF-MMI-xent': lfmmi_xent,
+                },
+                step=iter)
+                last_iter = iter
+        sleep(1)
+
 
 def run(args):
+
     os.environ["WANDB_MODE"] = args.wandb_mode
 
     task = Tasks(args.log_file, args.kaldi_path)
@@ -247,44 +282,24 @@ def run(args):
     for tst in args.test_sets:
         tst_path = Path(args.data_path) / args.data_name / tst.replace("_", "-")
         task.run(
-            f"local/download_and_untar.sh {args.data_path} {args.data_url} {tst}",
+            f"local/download_and_untar.sh {args.data_path} {args.data_url} {tst.replace('_', '-')}",
             tst_path,
         )
 
     # download lm
     task.run(f"local/download_lm.sh {args.lm_url} {args.lm_path}", args.lm_path)
 
-    # prep synth test data
-    test_synth_path = Path(args.data_path) / args.train_name / args.synth_test_set
-    dest_path = Path(args.local_data_path) / args.synth_test_set
-    if not dest_path.exists():
-        dest_path.mkdir()
-        load_synth(test_synth_path, dest_path)
-        rprint(f"[green]✓[/green] loading synthetic test data")
-    else:
-        rprint(f"[blue]{dest_path} already exists[blue]")
-    args.test_sets = args.test_sets + [args.synth_test_set]
-
-    # prep tts test data
-    tts_test_path = args.tts_test_path
-    dest_path = Path(args.local_data_path) / "tts_dev_clean"
-    if not dest_path.exists():
-        dest_path.mkdir()
-        load_synth(tts_test_path, dest_path)
-        rprint(f"[green]✓[/green] loading synthetic test data")
-    else:
-        rprint(f"[blue]{dest_path} already exists[blue]")
-    args.test_sets = args.test_sets + ["tts_dev_clean"]
-
     # prep train data
-    train_path = Path(args.data_path) / args.train_name / args.train_set
-    dest_path = Path(args.local_data_path) / args.train_set
+    train_path = Path(args.data_path) / args.train_name / Path(args.train_set)
+    dest_path = Path(args.local_data_path) / args.train_set.replace("/", "_")
     if not dest_path.exists():
-        dest_path.mkdir()
+        dest_path.mkdir(parents=True)
         load_synth(train_path, dest_path)
         rprint(f"[green]✓[/green] loading synthetic train data")
     else:
         rprint(f"[blue]{dest_path} already exists[blue]")
+
+    args.train_set = args.train_set.replace("/", "_")
 
     # prep test data
     for tst in args.test_sets:
@@ -394,24 +409,28 @@ def run(args):
     task.run(
         f"steps/align_si.sh --boost-silence 1.25 --nj {cpus} --cmd {args.train_cmd} {train_path} {args.lang_nosp_path} {args.tri1_path} {tri2b_ali_path}",
         tri2b_ali_path,
-        clean_tri2b,
+        clean=clean_tri2b,
     )
 
     task.run(
         f'steps/train_lda_mllt.sh --boost-silence 1.25 --cmd {args.train_cmd} --splice-opts "--left-context=3 --right-context=3" 2500 15000 {train_path} {args.lang_nosp_path} {tri2b_ali_path} {args.tri2b_path}',
         args.tri2b_path,
+        clean=clean_tri2b,
     )
     score_model(task, args, args.tri2b_path, "tri2b", True)
 
     # tri3b
     tri3b_ali_path = str(args.tri3b_path) + "_ali"
+    clean_tri3b = "tri3b" in args.clean_stages or "all" in args.clean_stages
     task.run(
         f"steps/align_fmllr.sh --nj {cpus} --cmd {args.train_cmd} --use-graphs true {train_path} {args.lang_nosp_path} {args.tri2b_path} {tri3b_ali_path}",
         tri3b_ali_path,
+        clean=clean_tri3b,
     )
     task.run(
         f"steps/train_sat.sh --cmd {args.train_cmd} 2500 15000 {train_path} {args.lang_nosp_path} {tri3b_ali_path} {args.tri3b_path}",
         args.tri3b_path,
+        clean=clean_tri3b,
     )
     score_model(task, args, args.tri3b_path, "tri3b", True)
 
@@ -423,14 +442,17 @@ def run(args):
             args.tri3b_path / "sil_counts_nowb.txt",
             args.tri3b_path / "pron_bigram_counts_nowb.txt",
         ],
+        clean=clean_tri3b,
     )
     task.run(
         f'utils/dict_dir_add_pronprobs.sh --max-normalize true {args.dict_nosp_path} {args.tri3b_path / "pron_counts_nowb.txt"} {args.tri3b_path / "sil_counts_nowb.txt"} {args.tri3b_path / "pron_bigram_counts_nowb.txt"} {args.dict_path}',
         args.dict_path,
+        clean=clean_tri3b,
     )
     task.run(
         f'utils/prepare_lang.sh {args.dict_path} "<UNK>" {args.lang_tmp_path} {args.lang_path}',
         args.lang_path,
+        clean=clean_tri3b,
     )
     task.run(
         f"local/format_lms.sh --src-dir {args.lang_path} {args.lm_path}",
@@ -438,14 +460,24 @@ def run(args):
             str(args.lang_path) + "_test_tgsmall",
             str(args.lang_path) + "_test_tgmed",
         ],
+        clean=clean_tri3b,
     )
     score_model(task, args, args.tri3b_path, "tri3b-probs", True, False)
 
     # train tdnn
+    if args.use_cnn:
+        network_file = "cnn_network.txt"
+        exp_name = "tdnn_cnn_1a_sp"
+        args.nnet_script_path = str(args.nnet_script_path).replace("run_tdnn_1d", "run_cnn_tdnn_1a")
+    else:
+        network_file = "network.txt"
+        exp_name = "tdnn_1d_sp"
     tri3b_ali_path = str(args.tri3b_path) + f"_ali_{train_path.name}_sp"
+    clean_tdnn = "tdnn" in args.clean_stages or "all" in args.clean_stages
     task.run(
         f"steps/align_fmllr.sh --nj {cpus} --cmd {args.train_cmd} {train_path} {args.lang_path} {args.tri3b_path} {tri3b_ali_path}",
         tri3b_ali_path,
+        clean=clean_tdnn,
     )
     if not Path(args.nnet_path / "data").exists():
         os.symlink(str(args.local_data_path), str(args.nnet_path / "data"))
@@ -462,6 +494,9 @@ def run(args):
     task.run(
         f"sed -i 's/60000/1000/' {ivec_path}", run_in_kaldi=False
     )  # replace with \d+ and re
+    task.run(
+        f"sed -i 's/--nj [0-9]\+/--nj {cpus}/' {ivec_path}", run_in_kaldi=False
+    )
     ivec_txt = "".join(open(ivec_path, "r").readlines())
     ivec_txt = re.sub(
         r"(for data.* in \${train_set}_sp )([^;]+)(;)",
@@ -480,11 +515,18 @@ def run(args):
         r"(<<EOF > \$dir/configs/network\.xconfig((.|\n)*)[^<]EOF)", re.MULTILINE
     )
     replacement = "<<EOF > $dir/configs/network.xconfig\n"
-    for line in open("network.txt", "r"):
+    for line in open(network_file, "r"):
         replacement += f"  {line}"
     replacement += "\nEOF"
     nnet_txt = network_re.sub(replacement, nnet_txt)
-    nnet_txt = re.sub(r"num-jobs-final \d+", f"num-jobs-final 8", nnet_txt)
+    nnet_txt = re.sub(r"num-jobs-initial \d+", f"num-jobs-initial 1", nnet_txt)
+    nnet_txt = re.sub(r"num-jobs-final \d+", f"num-jobs-final 1", nnet_txt)
+    if '--use-gpu=wait' not in nnet_txt:
+        nnet_txt = nnet_txt.replace('train.py', 'train.py --use-gpu=wait')
+    if args.use_cmvn:
+        nnet_txt = re.sub("--feat.cmvn-opts \".*\"", "--feat.cmvn-opts \"--norm-means=true --norm-vars=true\"", nnet_txt)
+    else:
+        nnet_txt = re.sub("--feat.cmvn-opts \".*\"", "--feat.cmvn-opts \"--norm-means=false --norm-vars=false\"", nnet_txt)
 
     # disable mkgraph and decoding stage
     for stage in ["-le 16", "-le 17", "-le 18"]:
@@ -494,27 +536,56 @@ def run(args):
         nnet_file.write(nnet_txt)
 
     train_sp = args.local_data_path / (train_path.name + "_sp")
+    train_sp_hires = args.local_data_path / (train_path.name + "_sp_hires")
+    train_sp_subset = args.local_data_path / (train_path.name + "_sp_hires_60k")
     train_ali = args.local_exp_path / f"{args.tri3b_path.name}_ali_{train_path.name}_sp"
 
-    task.run(
-        f"{args.nnet_script_path} --train_set {train_path.name} --gmm {args.tri3b_path.name}",
-        [
-            train_sp,
-            train_ali,
-            args.local_exp_path / "nnet3_cleaned",
-            args.local_exp_path / "chain_cleaned",
-        ],
-        clean=False,
-    )
+
+    proc = multiprocessing.Process(target=monitor_nnet, args=(
+        args,
+        "tdnn", 
+        args.local_exp_path / "chain_cleaned" / exp_name
+    ))
+    proc.start()
+
+    try:
+        task.run(
+            f"{args.nnet_script_path} --train_set {train_path.name} --gmm {args.tri3b_path.name}",
+            [
+                train_sp,
+                train_ali,
+                args.local_exp_path / "nnet3_cleaned",
+                args.local_exp_path / "chain_cleaned",
+                str(args.lang_path) + "_chain",
+                train_sp_hires,
+                train_sp_subset
+            ],
+            clean=clean_tdnn,
+        )
+    except:
+        task.run(
+            f"{args.nnet_script_path} --train_set {train_path.name} --gmm {args.tri3b_path.name}",
+            [
+                train_sp,
+                train_ali,
+                args.local_exp_path / "nnet3_cleaned",
+                args.local_exp_path / "chain_cleaned",
+                str(args.lang_path) + "_chain",
+                train_sp_hires,
+                train_sp_subset
+            ],
+            clean=True,
+        )
     score_model(
         task,
         args,
-        args.local_exp_path / "chain_cleaned" / "tdnn_1d_sp",
+        args.local_exp_path / "chain_cleaned" / exp_name,
         "tdnn",
         True,
         False,
         nnet=True,
     )
+    proc.terminate()
 
 
 if __name__ == "__main__":

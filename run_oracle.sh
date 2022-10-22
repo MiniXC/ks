@@ -1,0 +1,2 @@
+pdm run python ks.py --train_set pitch_oracle --run_name pitch-oracle --verbose True --clean_stages all --wandb_mode online
+pdm run python ks.py --train_set energy_oracle --run_name energy-oracle --verbose True --clean_stages all --wandb_mode online
