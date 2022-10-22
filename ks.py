@@ -7,6 +7,7 @@ from multiprocessing import cpu_count
 import re
 import shutil
 import sys
+import selectors
 
 from transformers import HfArgumentParser
 from rich import print as rprint
@@ -38,7 +39,6 @@ class Args:
     lm_url: str = "www.openslr.org/resources/11"
     log_file: str = "train.log"
     test_sets: str = "dev_clean,test_clean"
-    tts_test_path: str = "../alignments/test"
     local_data_path: str = "data"
     local_exp_path: str = "exp"
     mfcc_path: str = "{data}/mfcc"
@@ -60,10 +60,11 @@ class Args:
         "../kaldi/egs/librispeech/s5/local/chain/tuning/run_tdnn_1d.sh"
     )
     tdnn_path: str = "{exp}/tdnn"
-    verbose: bool = False
+    verbose: bool = True
     run_name: str = None
     clean_stages: str = "none"
 
+run_name = generate_slug(2)
 
 class Tasks:
     def __init__(self, logfile, kaldi_path):
@@ -71,19 +72,33 @@ class Tasks:
         self.kaldi_path = kaldi_path
 
     def execute(self, command, **kwargs):
-        popen = subprocess.Popen(
+        p = subprocess.Popen(
             f"{command}",
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             **kwargs,
         )
-        for line in popen.stdout:
-            yield line.decode()
-        for line in popen.stderr:
-            yield line.decode()
-        popen.stdout.close()
-        return_code = popen.wait()
+
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+        sel.register(p.stderr, selectors.EVENT_READ)
+
+        break_loop = False
+
+        while not break_loop:
+            for key, _ in sel.select():
+                data = key.fileobj.read1().decode()
+                if not data:
+                    break_loop = True
+                    break
+                if key.fileobj is p.stdout:
+                    yield data
+                else:
+                    yield data
+
+        p.stdout.close()
+        return_code = p.wait()
         if return_code:
             raise subprocess.CalledProcessError(return_code, command)
 
@@ -137,10 +152,8 @@ class Tasks:
                 rprint(f"[blue]{p} already exists[blue]")
 
 
-run_name = generate_slug(2)
-
-
 def score_model(task, args, path, name, fmllr=False, lang_nosp=True, nnet=False):
+    global run_name
     if args.run_name is not None:
         run_name = args.run_name
     if args.log_models == "all" or name in args.log_models.split(","):
@@ -247,37 +260,16 @@ def run(args):
     for tst in args.test_sets:
         tst_path = Path(args.data_path) / args.data_name / tst.replace("_", "-")
         task.run(
-            f"local/download_and_untar.sh {args.data_path} {args.data_url} {tst}",
+            f"local/download_and_untar.sh {args.data_path} {args.data_url} {tst.replace('_', '-')}",
             tst_path,
         )
 
     # download lm
+    print(f"local/download_lm.sh {args.lm_url} {args.lm_path}")
     task.run(f"local/download_lm.sh {args.lm_url} {args.lm_path}", args.lm_path)
 
-    # prep synth test data
-    test_synth_path = Path(args.data_path) / args.train_name / args.synth_test_set
-    dest_path = Path(args.local_data_path) / args.synth_test_set
-    if not dest_path.exists():
-        dest_path.mkdir()
-        load_synth(test_synth_path, dest_path)
-        rprint(f"[green]✓[/green] loading synthetic test data")
-    else:
-        rprint(f"[blue]{dest_path} already exists[blue]")
-    args.test_sets = args.test_sets + [args.synth_test_set]
-
-    # prep tts test data
-    tts_test_path = args.tts_test_path
-    dest_path = Path(args.local_data_path) / "tts_dev_clean"
-    if not dest_path.exists():
-        dest_path.mkdir()
-        load_synth(tts_test_path, dest_path)
-        rprint(f"[green]✓[/green] loading synthetic test data")
-    else:
-        rprint(f"[blue]{dest_path} already exists[blue]")
-    args.test_sets = args.test_sets + ["tts_dev_clean"]
-
     # prep train data
-    train_path = Path(args.data_path) / args.train_name / args.train_set
+    train_path = Path(args.data_path) / args.train_name
     dest_path = Path(args.local_data_path) / args.train_set
     if not dest_path.exists():
         dest_path.mkdir()
@@ -457,6 +449,9 @@ def run(args):
     task.run(
         f"sed -i 's/-le 24/-le -1/' {args.nnet_script_path}", run_in_kaldi=False
     )  # move lower
+    task.run(
+        f"sed -i 's/cmvn-opts \"--norm-means=false --norm-vars=false\"/cmvn-opts \"--norm-means=true --norm-vars=true\"/' {args.nnet_script_path}", run_in_kaldi=False
+    )  
     test_set_string = " ".join([f"{tst}_small" for tst in args.test_sets])
     ivec_path = args.nnet_path / "local" / "nnet3" / "run_ivector_common.sh"
     task.run(

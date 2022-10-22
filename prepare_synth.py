@@ -7,6 +7,8 @@ import re
 def load_synth(src, dest):
     synth_dict = {"speaker": [], "id": [], "wav": [], "text": []}
     for wav in Path(src).rglob("*.wav"):
+        if "original" in str(wav):
+            continue
         synth_dict["speaker"].append(wav.parent.name)
         synth_dict["id"].append(
             wav.parent.name + "-" + wav.name.replace(".wav", "").replace("_", "-")
