@@ -1,0 +1,29 @@
+input dim=100 name=ivector
+input dim=40 name=input
+
+# MFCC to filterbank
+idct-layer name=idct input=input dim=40 cepstral-lifter=22 affine-transform-file=$dir/configs/idct.mat
+
+linear-component name=ivector-linear l2-regularize=0.03 dim=200 input=ReplaceIndex(ivector, t, 0)
+batchnorm-component name=ivector-batchnorm target-rms=0.025
+batchnorm-component name=idct-batchnorm input=idct
+
+combine-feature-maps-layer name=combine_inputs input=Append(idct-batchnorm, ivector-batchnorm) num-filters1=1 num-filters2=5 height=40
+conv-relu-batchnorm-layer name=cnn1 l2-regularize=0.03 height-in=40 height-out=40 time-offsets=-1,0,1 height-offsets=-1,0,1 num-filters-out=64
+conv-relu-batchnorm-layer name=cnn2 l2-regularize=0.03 height-in=40 height-out=20 height-subsample-out=2 time-offsets=-1,0,1 height-offsets=-1,0,1 num-filters-out=128
+conv-relu-batchnorm-layer name=cnn3 l2-regularize=0.03 height-in=20 height-out=10 height-subsample-out=2 time-offsets=-1,0,1 height-offsets=-1,0,1 num-filters-out=256
+
+# the first TDNN-F layer has no bypass
+tdnnf-layer name=tdnnf1 l2-regularize=0.03 bypass-scale=0.0 dim=1536 bottleneck-dim=256 time-stride=0
+tdnnf-layer name=tdnnf2 l2-regularize=0.03 dim=1536 bottleneck-dim=160 time-stride=3
+tdnnf-layer name=tdnnf3 l2-regularize=0.03 dim=1536 bottleneck-dim=160 time-stride=3
+tdnnf-layer name=tdnnf4 l2-regularize=0.03 dim=1536 bottleneck-dim=160 time-stride=3
+tdnnf-layer name=tdnnf5 l2-regularize=0.03 dim=1536 bottleneck-dim=160 time-stride=3
+tdnnf-layer name=tdnnf6 l2-regularize=0.03 dim=1536 bottleneck-dim=160 time-stride=3
+linear-component name=prefinal-l dim=256 $linear_opts
+
+prefinal-layer name=prefinal-chain input=prefinal-l l2-regularize=0.008 big-dim=1536 small-dim=256
+output-layer name=output include-log-softmax=false dim=$num_targets l2-regularize=0.005
+
+prefinal-layer name=prefinal-xent input=prefinal-l l2-regularize=0.008 big-dim=1536 small-dim=256
+output-layer name=output-xent dim=$num_targets learning-rate-factor=$learning_rate_factor l2-regularize=0.005
